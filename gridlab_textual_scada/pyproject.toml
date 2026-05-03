@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68", "setuptools_scm>=8"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gridlab-textual-scada"
+dynamic = ["version"]
+description = "Custom Textual widgets and tabbed-app framework for terminal SCADA UIs."
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{ name = "Fabrizio Sossan" }]
+dependencies = [
+    "textual>=6.0",
+    "textual-slider>=0.2",
+    "netifaces>=0.11",
+]
+
+[project.scripts]
+gridlab-textual-scada-demo = "gridlab_textual_scada.demos:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools_scm]
+root = ".."
+git_describe_command = ["git", "describe", "--dirty", "--tags", "--long", "--match", "gridlab-textual-scada-v*"]
+tag_regex = "^gridlab-textual-scada-v(?P<version>.+)$"
+fallback_version = "0.0.0"
+version_file = "src/gridlab_textual_scada/_version.py"

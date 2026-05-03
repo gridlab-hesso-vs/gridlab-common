@@ -1,0 +1,11 @@
+build/
+secrets/
+*.egg-info/
+**/_version.py
+*.DS_store
+*.idea
+__pycache__/
+*.py[cod]
+~$*
+.vscode/
+.claude

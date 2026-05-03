@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68", "setuptools_scm>=8"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gridlab-modbus"
+dynamic = ["version"]
+description = "Modbus TCP client/server helpers, register data model, and Excel parser."
+requires-python = ">=3.10"
+dependencies = [
+  "pymodbus==3.9.2",
+  "construct",
+  "pandas",
+  "openpyxl",
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["gridlab_modbus*"]
+
+[tool.setuptools_scm]
+root = ".."
+git_describe_command = ["git", "describe", "--dirty", "--tags", "--long", "--match", "gridlab-modbus-v*"]
+tag_regex = "^gridlab-modbus-v(?P<version>.+)$"
+fallback_version = "0.0.0"
+version_file = "src/gridlab_modbus/_version.py"
