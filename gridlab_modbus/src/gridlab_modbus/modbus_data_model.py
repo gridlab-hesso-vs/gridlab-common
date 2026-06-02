@@ -748,6 +748,11 @@ class ModbusData:
                     yield var.name, var
 
 
+    def list_vars(self, *, direction: str = '*', modbus_area: str = '*') -> list[str]:
+        """Return the names of all variables matching the given filters."""
+        return [name for name, _ in self.get_var_specs(direction=direction, modbus_area=modbus_area)]
+
+
     def get_var_values(self, *, direction: str = '*', modbus_area: str = '*') -> Iterator[tuple[str, Any]]:
         """
         Return a dictionary of variable values
@@ -758,10 +763,60 @@ class ModbusData:
             raise ValueError(f"Invalid modbus area filter: {modbus_area}")
 
         for block in self.blocks:
-            if ((direction == '*' or direction == block.direction) and 
+            if ((direction == '*' or direction == block.direction) and
                 (modbus_area == '*' or modbus_area == block.storage)):
                 for var_name, var_value in block.var_values.items():
                     yield var_name, var_value
+
+
+    def format_values(self, *, direction: str = '*', title: str | None = None, names: list[str] | None = None) -> str:
+        """
+        Return a compact, flat table of variable names, values, and units.
+
+        Rows with None values are omitted. Values are right-aligned and rounded
+        to the decimal_digits defined in their VarSpec. If title is given the
+        table is wrapped between two rule lines bearing the title. If names is
+        given, only those variables are included (in the order provided).
+        """
+        specs = dict(self.get_var_specs(direction=direction))
+        values = dict(self.get_var_values(direction=direction))
+
+        keys = names if names is not None else list(specs.keys())
+
+        rows: list[tuple[str, str, str]] = []
+        for name in keys:
+            spec = specs.get(name)
+            value = values.get(name)
+            if value is None or spec is None:
+                continue
+            unit = spec.unit or ''
+            fmt = f"{value:.{spec.decimal_digits}f}" if isinstance(value, float) else str(value)
+            rows.append((name, fmt, unit))
+
+        if not rows:
+            body = '  (no values)'
+        else:
+            name_w = max(len(r[0]) for r in rows)
+            val_w  = max(len(r[1]) for r in rows)
+            lines = [
+                f"{name:<{name_w}}  {val:>{val_w}}  {unit}".rstrip()
+                for name, val, unit in rows
+            ]
+            body = '\n'.join(lines)
+
+        if title is None:
+            return body
+
+        bar_width = max((len(ln) for ln in body.splitlines()), default=0)
+        bar_width = max(bar_width, len(title) + 4)
+        header = f' {title} '.center(bar_width, '─')
+        footer = '─' * bar_width
+        return f'{header}\n{body}\n{footer}'
+
+
+def format_modbus_values(data: 'ModbusData', *, direction: str = '*', title: str | None = None, names: list[str] | None = None) -> str:
+    """Standalone wrapper around ModbusData.format_values — useful when a plain function call is preferred."""
+    return data.format_values(direction=direction, title=title, names=names)
 
 
 if __name__ == '__main__':
