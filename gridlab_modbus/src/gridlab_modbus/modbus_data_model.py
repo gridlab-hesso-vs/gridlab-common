@@ -63,11 +63,14 @@ class VarSpec:
     decimal_digits: int = 0
     notes: str = ""
     scale_factor: float = 1             # Physical value = raw_value * scale_factor
+    scale_ref: str | None = None        # Name of another variable whose value supplies a (static) scale, folded into scale_factor at init. None = use constant scale_factor.
+    scale_mode: str = "exponent"        # How scale_ref is applied: "exponent" => *10**sf (SunSpec convention), "factor" => *sf.
 
     byte_length: int | None = None      # Number of bytes (only for string types, and multiple of 2)
     min_val: Any | None = None          # Inclusive lower bound for validation (None = unbounded)
     max_val: Any | None = None          # Inclusive upper bound for validation (None = unbounded)
     size: int = field(init=False)       # Size of the variable (automatically calculated in post-init) - in words (16-bit registers)
+    _base_scale_factor: float = field(init=False, default=1.0, repr=False)  # Authored scale_factor, preserved so scale_ref resolution is idempotent.
 
     def cast(self, value: Any) -> Any:
         """Cast `value` to the native Python type for this VarSpec's value_type."""
@@ -97,6 +100,13 @@ class VarSpec:
                 raise ValueError(f"Unsupported value type: {self.value_type}")
             construct_type = ValueTypeToConstruct[self.value_type]
             self.size = construct_type.sizeof() // 2
+
+        # Preserve the authored scale factor so scale_ref resolution stays idempotent.
+        self._base_scale_factor = self.scale_factor
+        if self.scale_ref is not None and self.scale_mode not in ("exponent", "factor"):
+            raise ValueError(
+                f"Invalid scale_mode '{self.scale_mode}' for variable '{self.name}' (use 'exponent' or 'factor')."
+            )
 
 
 
@@ -732,6 +742,51 @@ class ModbusData:
 
 
 
+    def resolve_scale_refs(self) -> int:
+        """
+        Fold dynamic scale factors that reference another register's value into
+        each dependent VarSpec's effective `scale_factor` (computed from the
+        authored base, so this is idempotent):
+
+        - "exponent": scale_factor = base * 10 ** sf_value   (SunSpec convention)
+        - "factor"  : scale_factor = base * sf_value
+
+        Must be called after the referenced registers have been read (e.g. during
+        initialize()). Returns the number of variables resolved.
+        """
+        resolved = 0
+        for _, spec in self.get_var_specs():
+            if not spec.scale_ref:
+                continue
+            try:
+                sf_value = self.get_var_value(spec.scale_ref)
+            except KeyError:
+                sf_value = None
+            if sf_value is None:
+                raise ValueError(
+                    f"Cannot resolve scale for '{spec.name}': referenced register "
+                    f"'{spec.scale_ref}' has no value (ensure it is read during init)."
+                )
+            if spec.scale_mode == "exponent":
+                spec.scale_factor = spec._base_scale_factor * (10 ** sf_value)
+            elif spec.scale_mode == "factor":
+                spec.scale_factor = spec._base_scale_factor * sf_value
+            else:
+                raise ValueError(f"Unknown scale_mode '{spec.scale_mode}' for variable '{spec.name}'.")
+            resolved += 1
+        return resolved
+
+
+    def _resolve_scales_and_rescale(self, *, slave: int, read_all: bool) -> None:
+        """
+        Resolve scale_ref factors from the just-read values, then re-read once so
+        dependent registers are decoded with their corrected scale factors. No-op
+        (and no extra Modbus traffic) when no variable uses scale_ref.
+        """
+        if self.resolve_scale_refs():
+            self.sync_read(slave=slave, read_all=read_all, force=True)
+
+
     def initialize(self, *, mode: InitMode = InitMode.READ_INPUTS_AND_OUTPUTS, slave: int = 0) -> None:
         """
         Initialize the local model after the Modbus interface has been attached.
@@ -747,14 +802,17 @@ class ModbusData:
         # Silent initialization: read only input blocks to populate the local model with the current device state
         if mode == InitMode.READ_INPUTS:
             self.sync_read(slave=slave, read_all=False, force=True)
+            self._resolve_scales_and_rescale(slave=slave, read_all=False)
 
         # Silent initialization: read all blocks without writing, to populate the local model with the current device state
         elif mode == InitMode.READ_INPUTS_AND_OUTPUTS:
             self.sync_read(slave=slave, read_all=True, force=True)
+            self._resolve_scales_and_rescale(slave=slave, read_all=True)
 
         # Active initialization: read all blocks, and write defaults
         elif mode == InitMode.INIT_OUTPUTS_FROM_DEFAULTS:
             self.sync_read(slave=slave, read_all=True, force=True)   # Get a full snapshot of device state locally
+            self._resolve_scales_and_rescale(slave=slave, read_all=True)  # Fold scale_ref registers into scale_factor, re-decode
             self.apply_defaults_to_local(outputs_only=True)          # Set local output values to defaults
             self.sync(slave=slave, force=True)                       # Push output to device (one-shot/config blocks included)
         else:

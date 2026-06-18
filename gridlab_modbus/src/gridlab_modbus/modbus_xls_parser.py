@@ -24,6 +24,13 @@ and write-once configuration rows so they are handled at init only and skipped i
 the periodic sync loop. Consecutive rows that share direction and Periodic group
 into one block, so keep your one-shot rows together.
 
+Register sheets may also include 'Scale ref' and 'Scale mode' columns for a scale
+factor supplied by another register (e.g. SunSpec). 'Scale ref' names the register
+holding the scale; 'Scale mode' is 'exponent' (physical = raw * 10**sf, default) or
+'factor' (physical = raw * sf). These are resolved once during ModbusData.initialize()
+and folded into the variable's constant scale_factor, so mark the referenced
+scale register Periodic=FALSE (read once at init).
+
 
 The main function is `parse_modbusdata_from_xls`.
 
@@ -76,12 +83,17 @@ SHEETS = {
 
 
 # Optional columns: recognized on any sheet, not required. Spreadsheets that omit
-# them stay valid. 'Periodic' maps to Block.periodic (refresh cadence).
-OPTIONAL_COLS = {"Periodic"}
+# them stay valid. 'Periodic' maps to Block.periodic (refresh cadence); 'Scale ref'
+# and 'Scale mode' map to VarSpec dynamic scaling (register-supplied scale factor).
+OPTIONAL_COLS = {"Periodic", "Scale ref", "Scale mode"}
 
 # Spreadsheet cell values accepted for the optional 'Periodic' column.
 _PERIODIC_TRUE = {"true", "1", "yes", "y", "periodic", "cyclic", "poll"}
 _PERIODIC_FALSE = {"false", "0", "no", "n", "once", "static", "init", "one-shot", "oneshot"}
+
+# Spreadsheet cell values accepted for the optional 'Scale mode' column.
+_SCALE_MODE_EXP = {"exponent", "exp", "sunssf", "sf", "pow10"}
+_SCALE_MODE_FAC = {"factor", "mul", "multiplier", "gain"}
 
 
 def _coerce_periodic(value) -> bool:
@@ -103,6 +115,26 @@ def _coerce_periodic(value) -> bool:
     if s in _PERIODIC_FALSE:
         return False
     raise ValueError(f"Unrecognized 'Periodic' value: {value!r} (use TRUE/FALSE).")
+
+
+def _coerce_scale_ref(value) -> str | None:
+    """Coerce a spreadsheet 'Scale ref' cell to a variable name or None (blank)."""
+    if value is None or pd.isna(value):
+        return None
+    s = str(value).strip()
+    return s if s else None
+
+
+def _coerce_scale_mode(value) -> str:
+    """Coerce a spreadsheet 'Scale mode' cell to 'exponent' (default) or 'factor'."""
+    if pd.isna(value):
+        return "exponent"
+    s = str(value).strip().lower()
+    if s == "" or s in _SCALE_MODE_EXP:
+        return "exponent"
+    if s in _SCALE_MODE_FAC:
+        return "factor"
+    raise ValueError(f"Unrecognized 'Scale mode' value: {value!r} (use 'exponent' or 'factor').")
 
 
 def parse_modbus_area_from_xls(xls_filename: str, area: ModbusArea, *, invert_rw: bool = False, register_offset: int = 0) -> pd.DataFrame:
@@ -249,6 +281,8 @@ def add_register_var(
     dec: int,
     unit: str,
     scale_factor: float = 1.0,
+    scale_ref: str | None = None,
+    scale_mode: str = "exponent",
     min_val=None,
     max_val=None,
     notes: str | None = None,
@@ -265,6 +299,8 @@ def add_register_var(
             decimal_digits=dec,
             default=default_value,
             scale_factor=scale_factor,
+            scale_ref=scale_ref,
+            scale_mode=scale_mode,
             min_val=min_val,
             max_val=max_val,
             notes=notes if notes is not None else "",
@@ -333,6 +369,9 @@ def create_blocks_from_df(df: pd.DataFrame, area: ModbusArea, fill_gaps: bool = 
             if pd.isna(scale_factor):
                 scale_factor = 1
 
+            scale_ref = _coerce_scale_ref(row.get("Scale ref", None))
+            scale_mode = _coerce_scale_mode(row.get("Scale mode", None))
+
             min_val = row.get("Min value", None)
             if pd.isna(min_val):
                 min_val = None
@@ -350,6 +389,8 @@ def create_blocks_from_df(df: pd.DataFrame, area: ModbusArea, fill_gaps: bool = 
                 dec=dec,
                 unit=unit,
                 scale_factor=scale_factor,
+                scale_ref=scale_ref,
+                scale_mode=scale_mode,
                 min_val=min_val,
                 max_val=max_val,
                 notes=row_notes,
