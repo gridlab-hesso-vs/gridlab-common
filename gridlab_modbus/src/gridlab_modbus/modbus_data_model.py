@@ -108,7 +108,8 @@ class Block:
     storage: ModbusArea
     initial_address: int
     direction: Direction = "input"
-    
+    periodic: bool = True                                                               # True: synced every cycle. False: handled once at init (read for input blocks, write for output/config blocks), then skipped in the periodic sync loop. A direct block.sync_read()/sync_write() always works regardless.
+
     var_specs: Dict[str, VarSpec] = field(default_factory=dict, init=False)              # Var specs
     var_values: Dict[str, Any] = field(default_factory=dict)                            # Decoded values for the block variables (after applying scaling factor) populated for input blocks after sync_read.
     _construct: Struct | None = None                                                # Construct object
@@ -186,7 +187,37 @@ class Block:
         self.var_specs[var.name] = var
 
 
-    
+    def add_bool(self, name: str, init_val: bool = False, *, address: int | None = None, notes: str | None = None) -> None:
+        """
+        Convenience helper to add a single-bit (coil / discrete input) variable.
+
+        `address` is accepted for caller convenience but not stored: variable
+        addresses are derived positionally from the block's initial_address.
+        """
+        self.add_var(VarSpec(
+            name=name,
+            value_type="bit",
+            default=bool(init_val),
+            notes=notes if isinstance(notes, str) else "",
+        ))
+
+
+    def add_uint16(self, name: str, value: Any = 0, *, address: int | None = None, notes: str | None = None) -> None:
+        """
+        Convenience helper to add a uint16 register variable (e.g. gap fillers).
+
+        `address` is accepted for caller convenience but not stored: variable
+        addresses are derived positionally from the block's initial_address.
+        """
+        self.add_var(VarSpec(
+            name=name,
+            value_type="uint16",
+            default=value,
+            notes=notes if isinstance(notes, str) else "",
+        ))
+
+
+
     def apply_defaults_to_local(self) -> None:
         """
         Initialize the block value buffer from variable defaults and publish them atomically.
@@ -400,7 +431,7 @@ class Block:
         """
 
         lines = []
-        lines.append(f"Block(storage='{self.storage}', direction='{self.direction}', initial_address={self.initial_address})")
+        lines.append(f"Block(storage='{self.storage}', direction='{self.direction}', initial_address={self.initial_address}, periodic={self.periodic})")
         lines.append("")
         header = (
             f"{'Name':<30}"
@@ -530,6 +561,20 @@ This model encourages choosing an intialization mode on startup. The following c
 * (passive master): read input and output registers and populate the local variables.
 * (active master): read input registers, populate the local variables, and write output registers with the initial values defined in the VarSpecs.
 ### For server:
+
+## Periodic vs one-shot blocks
+
+Each Block has a `periodic` flag (default True) controlling its refresh cadence,
+independently of `direction`:
+
+* `periodic=True`  : synced on every cycle (steady-state `sync_read`/`sync_write`/`sync`).
+* `periodic=False` : handled once during `initialize()` (read for input blocks such as
+                     nameplate/firmware, written-from-defaults for output/config blocks),
+                     then skipped in the periodic loop. A direct `block.sync_read()` /
+                     `block.sync_write()` still re-syncs it on demand.
+
+Put read-once (nameplate/status) and write-once (configuration/settings) registers in
+their own `periodic=False` blocks so they don't consume bus transactions every cycle.
 """
 
 from enum import Enum
@@ -604,8 +649,10 @@ class ModbusData:
 
 
     # --- synchronization commands
-    def sync_read(self, *, slave: int = 0, read_all: bool = False) -> None:
+    def sync_read(self, *, slave: int = 0, read_all: bool = False, force: bool = False) -> None:
         for block in self.blocks:
+            if not block.periodic and not force:
+                continue  # one-shot block: read once at init (force=True), skip in the periodic loop
             if block.direction == "input" or read_all:
                 try:
                     block.sync_read(slave=slave, read_all=read_all)
@@ -616,15 +663,19 @@ class ModbusData:
         self._maybe_print_stats()
 
     
-    def sync_write(self, slave: int = 0) -> None:
+    def sync_write(self, slave: int = 0, force: bool = False) -> None:
         for block in self.blocks:
+            if not block.periodic and not force:
+                continue  # one-shot/config block: written once at init (force=True), skip in the periodic loop
             if block.direction == "output":
                 # TODO: add writing stats.
                 block.sync_write(slave=slave)
 
     
-    def sync(self, *, slave: int = 0, read_all: bool = False) -> None:
+    def sync(self, *, slave: int = 0, read_all: bool = False, force: bool = False) -> None:
         for block in self.blocks:
+            if not block.periodic and not force:
+                continue  # one-shot/config block: synced once at init (force=True), skip in the periodic loop
             block.sync(slave=slave, read_all=read_all)
     
 
@@ -695,17 +746,17 @@ class ModbusData:
 
         # Silent initialization: read only input blocks to populate the local model with the current device state
         if mode == InitMode.READ_INPUTS:
-            self.sync_read(slave=slave, read_all=False)
+            self.sync_read(slave=slave, read_all=False, force=True)
 
         # Silent initialization: read all blocks without writing, to populate the local model with the current device state
         elif mode == InitMode.READ_INPUTS_AND_OUTPUTS:
-            self.sync_read(slave=slave, read_all=True)
+            self.sync_read(slave=slave, read_all=True, force=True)
 
         # Active initialization: read all blocks, and write defaults
         elif mode == InitMode.INIT_OUTPUTS_FROM_DEFAULTS:
-            self.sync_read(slave=slave, read_all=True)       # Get a full snapshot of device state locally
-            self.apply_defaults_to_local(outputs_only=True)  # Set local output values to defaults
-            self.sync(slave=slave)                           # Push output to device
+            self.sync_read(slave=slave, read_all=True, force=True)   # Get a full snapshot of device state locally
+            self.apply_defaults_to_local(outputs_only=True)          # Set local output values to defaults
+            self.sync(slave=slave, force=True)                       # Push output to device (one-shot/config blocks included)
         else:
             raise ValueError(f"Unknown init mode: {mode}")
         

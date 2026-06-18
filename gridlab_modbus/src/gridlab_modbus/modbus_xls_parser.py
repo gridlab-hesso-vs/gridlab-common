@@ -16,7 +16,13 @@ and synchronization layers.
 
 Although some validation rules are present in the Excel sheets for user convenience
 at the time of defining the register specifications, this module intentionally
-ignores Excel validation rules. 
+ignores Excel validation rules.
+
+Optional columns: any sheet may include a 'Periodic' column (TRUE/FALSE, default
+TRUE). It maps to Block.periodic — set FALSE for read-once nameplate/status rows
+and write-once configuration rows so they are handled at init only and skipped in
+the periodic sync loop. Consecutive rows that share direction and Periodic group
+into one block, so keep your one-shot rows together.
 
 
 The main function is `parse_modbusdata_from_xls`.
@@ -69,6 +75,35 @@ SHEETS = {
 }
 
 
+# Optional columns: recognized on any sheet, not required. Spreadsheets that omit
+# them stay valid. 'Periodic' maps to Block.periodic (refresh cadence).
+OPTIONAL_COLS = {"Periodic"}
+
+# Spreadsheet cell values accepted for the optional 'Periodic' column.
+_PERIODIC_TRUE = {"true", "1", "yes", "y", "periodic", "cyclic", "poll"}
+_PERIODIC_FALSE = {"false", "0", "no", "n", "once", "static", "init", "one-shot", "oneshot"}
+
+
+def _coerce_periodic(value) -> bool:
+    """
+    Coerce a spreadsheet 'Periodic' cell to a bool. Blank/missing defaults to True
+    (block synced every cycle); recognized one-shot values map to False.
+    """
+    if pd.isna(value):
+        return True
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(int(value))
+    s = str(value).strip().lower()
+    if s == "":
+        return True
+    if s in _PERIODIC_TRUE:
+        return True
+    if s in _PERIODIC_FALSE:
+        return False
+    raise ValueError(f"Unrecognized 'Periodic' value: {value!r} (use TRUE/FALSE).")
+
 
 def parse_modbus_area_from_xls(xls_filename: str, area: ModbusArea, *, invert_rw: bool = False, register_offset: int = 0) -> pd.DataFrame:
     """
@@ -100,14 +135,20 @@ def parse_modbus_area_from_xls(xls_filename: str, area: ModbusArea, *, invert_rw
             f"Please remove extra empty columns."
         )
 
-    if actual_cols != expected_cols:
-        missing = [c for c in expected_cols if c not in actual_cols]
-        extra = [c for c in actual_cols if c not in expected_cols]
+    # 'Periodic' is an optional column (default True). The required columns must
+    # still match exactly (including order); the optional column may appear anywhere.
+    present_optional = [c for c in actual_cols if c in OPTIONAL_COLS]
+    required_actual = [c for c in actual_cols if c not in OPTIONAL_COLS]
+
+    if required_actual != expected_cols:
+        missing = [c for c in expected_cols if c not in required_actual]
+        extra = [c for c in required_actual if c not in expected_cols]
 
         msg = (
             f"Invalid column layout in sheet '{sheet}' of '{xls_filename}'.\n"
-            f"Expected columns (exact order): {expected_cols}\n"
-            f"Actual columns:               {actual_cols}\n"
+            f"Expected required columns (exact order): {expected_cols}\n"
+            f"Actual required columns:                 {required_actual}\n"
+            f"(Optional columns allowed anywhere: {sorted(OPTIONAL_COLS)})\n"
         )
         if missing:
             msg += f"Missing columns: {missing}\n"
@@ -115,18 +156,25 @@ def parse_modbus_area_from_xls(xls_filename: str, area: ModbusArea, *, invert_rw
             msg += f"Extra columns:   {extra}\n"
 
         # Detect “same set but different order”
-        if not missing and not extra and set(actual_cols) == set(expected_cols):
+        if not missing and not extra and set(required_actual) == set(expected_cols):
             msg += "Columns are correct but the order is wrong.\n"
 
         raise ValueError(msg)
-    
 
-    # Now read the file
-    df = pd.read_excel(xls_filename, sheet_name=sheet, usecols=expected_cols)
+
+    # Now read the file (include the optional 'Periodic' column when present)
+    df = pd.read_excel(xls_filename, sheet_name=sheet, usecols=expected_cols + present_optional)
 
     # Drop unnamed rows
     df = df.dropna(subset=["Name"])
     df = df[df["Name"].astype(str).str.strip() != ""]
+
+    # Normalize the optional 'Periodic' column to bool (default True when absent/blank)
+    if "Periodic" in df.columns:
+        df["Periodic"] = df["Periodic"].map(_coerce_periodic)
+    else:
+        df["Periodic"] = True
+
     if df.empty:
         return df
 
@@ -235,6 +283,7 @@ def create_blocks_from_df(df: pd.DataFrame, area: ModbusArea, fill_gaps: bool = 
     blocks = []
     current_block = None
     current_direction = None
+    current_periodic = None
     current_address = None
 
     for _, row in df.iterrows():
@@ -251,18 +300,22 @@ def create_blocks_from_df(df: pd.DataFrame, area: ModbusArea, fill_gaps: bool = 
         else:
             direction = "input"
 
+        periodic = bool(row.get("Periodic", True))
+
         make_new_block = (
             current_block is None
             or direction != current_direction
+            or periodic != current_periodic
             or (not fill_gaps and current_address < addr)
         )
 
         if make_new_block:
             if current_block is not None:
                 blocks.append(current_block)
-            
-            current_block = Block(storage=area, initial_address=addr, direction=direction)
+
+            current_block = Block(storage=area, initial_address=addr, direction=direction, periodic=periodic)
             current_direction = direction
+            current_periodic = periodic
             current_address = addr
 
         while fill_gaps and current_address < addr:
