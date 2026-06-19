@@ -31,6 +31,13 @@ holding the scale; 'Scale mode' is 'exponent' (physical = raw * 10**sf, default)
 and folded into the variable's constant scale_factor, so mark the referenced
 scale register Periodic=FALSE (read once at init).
 
+Register sheets may also include a 'Sentinel' column for SunSpec-style "not
+implemented" handling (default blank = off). 'auto' (or 'sunspec'/'default') applies
+the type-derived sentinel — uint16 0xFFFF, sint16 -32768, uint32/sint32 likewise,
+float NaN; an explicit number sets a custom invalid value. A register reading its
+sentinel decodes to None instead of a number, and a variable whose 'Scale ref'
+source is itself not-implemented also decodes to None.
+
 
 The main function is `parse_modbusdata_from_xls`.
 
