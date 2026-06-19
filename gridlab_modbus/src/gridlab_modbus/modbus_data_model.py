@@ -17,6 +17,7 @@ Fabrizio Sossan
 
 """
 
+import math
 from typing import Dict, Literal, get_args
 from construct import Struct, Float32b, Int16ub, Int16sb, Bit, PaddedString, Int32ub, Int32sb, PaddedString
 from dataclasses import dataclass, field
@@ -54,6 +55,20 @@ ValueTypeToPython: dict[str, Callable[[Any], Any]] = {
 }
 
 
+# SunSpec-style "not implemented" sentinels, keyed by value_type and compared
+# against the DECODED (signed, pre-scale) value. Used when a VarSpec opts in via
+# its `sentinel` field ("auto"). float uses NaN (compared with math.isnan).
+NOT_IMPLEMENTED_SENTINEL: dict[str, Any] = {
+    "uint16": 0xFFFF,           # 65535
+    "sint16": -0x8000,          # -32768  (also the sunssf sentinel)
+    "uint32": 0xFFFFFFFF,
+    "sint32": -0x80000000,
+    "float": float("nan"),
+}
+# 'sentinel' cell keywords that mean "use the type-derived SunSpec sentinel".
+_SENTINEL_AUTO_KEYWORDS = {"auto", "default", "sunspec", "yes", "true", "1", "y"}
+
+
 @dataclass
 class VarSpec:
     name: str
@@ -65,16 +80,27 @@ class VarSpec:
     scale_factor: float = 1             # Physical value = raw_value * scale_factor
     scale_ref: str | None = None        # Name of another variable whose value supplies a (static) scale, folded into scale_factor at init. None = use constant scale_factor.
     scale_mode: str = "exponent"        # How scale_ref is applied: "exponent" => *10**sf (SunSpec convention), "factor" => *sf.
+    sentinel: Any = None                # "Not implemented" value: None (off), a raw value, or "auto" (type-derived SunSpec sentinel). A read equal to it decodes to None instead of a number.
 
     byte_length: int | None = None      # Number of bytes (only for string types, and multiple of 2)
     min_val: Any | None = None          # Inclusive lower bound for validation (None = unbounded)
     max_val: Any | None = None          # Inclusive upper bound for validation (None = unbounded)
     size: int = field(init=False)       # Size of the variable (automatically calculated in post-init) - in words (16-bit registers)
     _base_scale_factor: float = field(init=False, default=1.0, repr=False)  # Authored scale_factor, preserved so scale_ref resolution is idempotent.
+    _scale_unavailable: bool = field(init=False, default=False, repr=False)  # Set during resolve_scale_refs when this var's scale_ref source is itself "not implemented"; forces decode to None.
 
     def cast(self, value: Any) -> Any:
         """Cast `value` to the native Python type for this VarSpec's value_type."""
         return ValueTypeToPython[self.value_type](value)
+
+    def is_sentinel(self, raw: Any) -> bool:
+        """True if `raw` (the decoded, pre-scale value) is this var's 'not implemented' sentinel."""
+        s = self.sentinel
+        if s is None:
+            return False
+        if isinstance(s, float) and math.isnan(s):
+            return isinstance(raw, float) and math.isnan(raw)
+        return raw == s
 
     def __post_init__(self):
         """
@@ -107,6 +133,24 @@ class VarSpec:
             raise ValueError(
                 f"Invalid scale_mode '{self.scale_mode}' for variable '{self.name}' (use 'exponent' or 'factor')."
             )
+
+        # Resolve an "auto" sentinel keyword to the type-derived SunSpec sentinel.
+        # A numeric sentinel is kept as-is (custom invalid value); None means off.
+        if isinstance(self.sentinel, str):
+            key = self.sentinel.strip().lower()
+            if key == "":
+                self.sentinel = None
+            elif key in _SENTINEL_AUTO_KEYWORDS:
+                if self.value_type not in NOT_IMPLEMENTED_SENTINEL:
+                    raise ValueError(
+                        f"No auto sentinel for value_type '{self.value_type}' (variable '{self.name}')."
+                    )
+                self.sentinel = NOT_IMPLEMENTED_SENTINEL[self.value_type]
+            else:
+                raise ValueError(
+                    f"Unrecognized sentinel '{self.sentinel}' for variable '{self.name}' "
+                    "(use 'auto', a number, or leave blank)."
+                )
 
 
 
@@ -327,7 +371,11 @@ class Block:
             for name in decoded_data:
                 spec = self.var_specs[name]
                 val = decoded_data[name]
-                if spec.value_type in ("float", "uint16", "sint16", "sint32", "uint32"):
+                if spec._scale_unavailable or spec.is_sentinel(val):
+                    # "Not implemented" (own sentinel, or its scale register is not
+                    # implemented) -> None, skipping scaling/rounding.
+                    val = None
+                elif spec.value_type in ("float", "uint16", "sint16", "sint32", "uint32"):
                     # Physical value = register_value * scale_factor
                     val = val * spec.scale_factor
                     # Apply decimal digits formatting if specified
@@ -758,11 +806,24 @@ class ModbusData:
         for _, spec in self.get_var_specs():
             if not spec.scale_ref:
                 continue
+            spec._scale_unavailable = False  # recompute from scratch (idempotent)
             try:
                 sf_value = self.get_var_value(spec.scale_ref)
             except KeyError:
                 sf_value = None
             if sf_value is None:
+                # Distinguish "scale register is not implemented" (sentinel) from
+                # "scale register was never read". The former is legitimate: the
+                # dependent value simply can't be scaled, so mark it not-implemented.
+                try:
+                    src = self.get_var_spec(spec.scale_ref)
+                except KeyError:
+                    src = None
+                if src is not None and src.sentinel is not None:
+                    spec._scale_unavailable = True
+                    spec.scale_factor = spec._base_scale_factor
+                    resolved += 1
+                    continue
                 raise ValueError(
                     f"Cannot resolve scale for '{spec.name}': referenced register "
                     f"'{spec.scale_ref}' has no value (ensure it is read during init)."

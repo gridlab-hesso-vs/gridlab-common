@@ -84,8 +84,13 @@ SHEETS = {
 
 # Optional columns: recognized on any sheet, not required. Spreadsheets that omit
 # them stay valid. 'Periodic' maps to Block.periodic (refresh cadence); 'Scale ref'
-# and 'Scale mode' map to VarSpec dynamic scaling (register-supplied scale factor).
-OPTIONAL_COLS = {"Periodic", "Scale ref", "Scale mode"}
+# and 'Scale mode' map to VarSpec dynamic scaling (register-supplied scale factor);
+# 'Sentinel' maps to VarSpec.sentinel ("not implemented" handling).
+OPTIONAL_COLS = {"Periodic", "Scale ref", "Scale mode", "Sentinel"}
+
+# Spreadsheet cell values accepted for the optional 'Sentinel' column.
+_SENTINEL_AUTO = {"auto", "default", "sunspec", "yes", "true", "1", "y"}
+_SENTINEL_OFF = {"false", "no", "n", "0", "off"}
 
 # Spreadsheet cell values accepted for the optional 'Periodic' column.
 _PERIODIC_TRUE = {"true", "1", "yes", "y", "periodic", "cyclic", "poll"}
@@ -135,6 +140,31 @@ def _coerce_scale_mode(value) -> str:
     if s in _SCALE_MODE_FAC:
         return "factor"
     raise ValueError(f"Unrecognized 'Scale mode' value: {value!r} (use 'exponent' or 'factor').")
+
+
+def _coerce_sentinel(value):
+    """
+    Coerce a spreadsheet 'Sentinel' cell. Blank/off -> None (no handling);
+    'auto'/keyword -> 'auto' (VarSpec resolves it to the type-derived SunSpec
+    sentinel); an explicit number (e.g. 32767 or 0xFFFF) -> that raw value.
+    """
+    if value is None or pd.isna(value):
+        return None
+    if isinstance(value, bool):
+        return "auto" if value else None
+    if isinstance(value, (int, float)):
+        return int(value)
+    s = str(value).strip()
+    if s == "" or s.lower() in _SENTINEL_OFF:
+        return None
+    if s.lower() in _SENTINEL_AUTO:
+        return "auto"
+    try:
+        return int(s, 0)   # explicit value, supports "0xFFFF" / "-32768"
+    except ValueError:
+        raise ValueError(
+            f"Unrecognized 'Sentinel' value: {value!r} (use 'auto', a number, or leave blank)."
+        )
 
 
 def parse_modbus_area_from_xls(xls_filename: str, area: ModbusArea, *, invert_rw: bool = False, register_offset: int = 0) -> pd.DataFrame:
@@ -283,6 +313,7 @@ def add_register_var(
     scale_factor: float = 1.0,
     scale_ref: str | None = None,
     scale_mode: str = "exponent",
+    sentinel=None,
     min_val=None,
     max_val=None,
     notes: str | None = None,
@@ -301,6 +332,7 @@ def add_register_var(
             scale_factor=scale_factor,
             scale_ref=scale_ref,
             scale_mode=scale_mode,
+            sentinel=sentinel,
             min_val=min_val,
             max_val=max_val,
             notes=notes if notes is not None else "",
@@ -371,6 +403,7 @@ def create_blocks_from_df(df: pd.DataFrame, area: ModbusArea, fill_gaps: bool = 
 
             scale_ref = _coerce_scale_ref(row.get("Scale ref", None))
             scale_mode = _coerce_scale_mode(row.get("Scale mode", None))
+            sentinel = _coerce_sentinel(row.get("Sentinel", None))
 
             min_val = row.get("Min value", None)
             if pd.isna(min_val):
@@ -391,6 +424,7 @@ def create_blocks_from_df(df: pd.DataFrame, area: ModbusArea, fill_gaps: bool = 
                 scale_factor=scale_factor,
                 scale_ref=scale_ref,
                 scale_mode=scale_mode,
+                sentinel=sentinel,
                 min_val=min_val,
                 max_val=max_val,
                 notes=row_notes,
