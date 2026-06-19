@@ -28,6 +28,36 @@ class ModbusReadingFailed(RuntimeError): ...
 class ModbusWritingFailed(RuntimeError): ...
 
 
+# Modbus protocol exception codes (function-code error responses), for diagnostics.
+_MODBUS_EXCEPTION_CODES = {
+    1: "IllegalFunction",
+    2: "IllegalDataAddress",
+    3: "IllegalDataValue",
+    4: "SlaveDeviceFailure",
+    5: "Acknowledge",
+    6: "SlaveDeviceBusy",
+    7: "NegativeAcknowledge",
+    8: "MemoryParityError",
+    10: "GatewayPathUnavailable",
+    11: "GatewayTargetDeviceFailedToRespond",
+}
+
+
+def _fail_detail(response, *, address: int, slave: int, count: int | None = None) -> str:
+    """
+    Human-readable cause for a failed pymodbus response: the Modbus exception code
+    and its name (e.g. '2 (IllegalDataAddress)') when present, or 'no response' on
+    timeout/connection loss. Saves callers from a bare 'failed' with no cause.
+    """
+    where = f"address={address}" + (f", count={count}" if count is not None else "") + f", slave={slave}"
+    if response is None:
+        return f"{where}: no response (timeout / connection lost)"
+    code = getattr(response, "exception_code", None)
+    if code is not None:
+        return f"{where}: exception_code={code} ({_MODBUS_EXCEPTION_CODES.get(code, 'Unknown')})"
+    return f"{where}: {response!r}"
+
+
 class ModbusInterface:
 
     # Standard naming for lifecycle methods (open/close) and read/write operations.
@@ -86,13 +116,17 @@ class ModbusTCPClient(ModbusInterface):
     def write_holding_registers(self, address: int, values: list[int], slave: int = 0) -> bool:
         response = self._client.write_registers(address, values, slave=slave)
         if response is None or response.isError():
-            raise ModbusWritingFailed("write_holding_registers failed")
-    
+            raise ModbusWritingFailed(
+                f"write_holding_registers failed — {_fail_detail(response, address=address, count=len(values), slave=slave)}"
+            )
+
 
     def write_coils(self, address: int, values: list[bool], slave: int = 0) -> bool:
         response = self._client.write_coils(address, values, slave=slave)
         if response is None or response.isError():
-            raise ModbusWritingFailed("write_coils failed")
+            raise ModbusWritingFailed(
+                f"write_coils failed — {_fail_detail(response, address=address, count=len(values), slave=slave)}"
+            )
 
 
     # ----------------------------------
@@ -101,27 +135,35 @@ class ModbusTCPClient(ModbusInterface):
     def read_holding_registers(self, address: int, count: int, slave: int = 0) -> list[int]:
         response = self._client.read_holding_registers(address, count=count, slave=slave)
         if not response or response.isError() or response.registers is None:
-            raise ModbusReadingFailed("read_holding_registers failed")
+            raise ModbusReadingFailed(
+                f"read_holding_registers failed — {_fail_detail(response, address=address, count=count, slave=slave)}"
+            )
         return list(response.registers)
 
     def read_input_registers(self, address: int, count: int, slave: int = 0) -> list[int]:
         response = self._client.read_input_registers(address, count=count, slave=slave)
         if not response or response.isError() or response.registers is None:
-            raise ModbusReadingFailed("read_input_registers failed")
+            raise ModbusReadingFailed(
+                f"read_input_registers failed — {_fail_detail(response, address=address, count=count, slave=slave)}"
+            )
         return list(response.registers)
 
     def read_coils(self, address: int, count: int, slave: int = 0) -> list[bool]:
         response = self._client.read_coils(address, count=count, slave=slave)
         if not response or response.isError() or response.bits is None:
-            raise ModbusReadingFailed("read_coils failed")
+            raise ModbusReadingFailed(
+                f"read_coils failed — {_fail_detail(response, address=address, count=count, slave=slave)}"
+            )
         # Pymodbus sometimes returns a bits list that’s longer than requested (padding).
         return [bool(b) for b in response.bits[:count]]
 
-    
+
     def read_discrete_inputs(self, address: int, count: int, slave: int = 0) -> list[bool]:
         response = self._client.read_discrete_inputs(address, count=count, slave=slave)
         if not response or response.isError() or response.bits is None:
-            raise ModbusReadingFailed("read_discrete_inputs failed")
+            raise ModbusReadingFailed(
+                f"read_discrete_inputs failed — {_fail_detail(response, address=address, count=count, slave=slave)}"
+            )
         # Pymodbus sometimes returns a bits list that’s longer than requested (padding).
         return [bool(b) for b in response.bits[:count]]
 
