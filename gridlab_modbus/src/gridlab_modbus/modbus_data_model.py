@@ -4,7 +4,8 @@ Modbus data model and register mapping.
 This module defines a small in-memory model for Modbus data organized as Blocks of
 contiguous addresses. Each Block contains VarSpec entries that describe how values
 are encoded/decoded from Modbus register/coil areas using `construct`, including
-optional scaling for numeric types and fixed-length ASCII strings.
+optional scaling and offset for numeric types, the word order of 32-bit values,
+and fixed-length ASCII strings.
 
 Concurrency: Block values are updated atomically. Readers should use `snapshot()`
 (or ModbusData.get()) to obtain a consistent view of values, and writers should
@@ -19,7 +20,7 @@ Fabrizio Sossan
 
 import math
 from typing import Dict, Literal, get_args
-from construct import Struct, Float32b, Int16ub, Int16sb, Bit, PaddedString, Int32ub, Int32sb, PaddedString
+from construct import Struct, Float32b, Int16ub, Int16sb, Bit, PaddedString, Int32ub, Int32sb, Transformed
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterator, Tuple
 
@@ -32,6 +33,9 @@ log = logger
 ModbusArea = Literal["holding_register", "input_register", "coil", "discrete_input"]
 Direction = Literal["input", "output"]
 ValueType = Literal["string", "float", "uint16", "sint16", "bit", "sint32", "uint32"]
+# Order of the two registers of a 32-bit integer or float. "big" is the Modbus convention and the
+# default (high word at the lower address); "little" is the word-swapped layout (low word first).
+WordOrder = Literal["big", "little"]
 
 
 ValueTypeToConstruct = {
@@ -85,6 +89,8 @@ class VarSpec:
     byte_length: int | None = None      # Number of bytes (only for string types, and multiple of 2)
     min_val: Any | None = None          # Inclusive lower bound for validation (None = unbounded)
     max_val: Any | None = None          # Inclusive upper bound for validation (None = unbounded)
+    offset: float = 0                   # Added after scaling: physical value = raw_value * scale_factor + offset
+    word_order: WordOrder = "big"       # 32-bit integers and floats only: "big" = high word first (Modbus default), "little" = low word first
     size: int = field(init=False)       # Size of the variable (automatically calculated in post-init) - in words (16-bit registers)
     _base_scale_factor: float = field(init=False, default=1.0, repr=False)  # Authored scale_factor, preserved so scale_ref resolution is idempotent.
     _scale_unavailable: bool = field(init=False, default=False, repr=False)  # Set during resolve_scale_refs when this var's scale_ref source is itself "not implemented"; forces decode to None.
@@ -127,6 +133,11 @@ class VarSpec:
             construct_type = ValueTypeToConstruct[self.value_type]
             self.size = construct_type.sizeof() // 2
 
+        if self.word_order not in get_args(WordOrder):
+            raise ValueError(
+                f"Invalid word_order '{self.word_order}' for variable '{self.name}' (use 'big' or 'little')."
+            )
+
         # Preserve the authored scale factor so scale_ref resolution stays idempotent.
         self._base_scale_factor = self.scale_factor
         if self.scale_ref is not None and self.scale_mode not in ("exponent", "factor"):
@@ -155,6 +166,37 @@ class VarSpec:
 
 
 
+
+
+def _swap_words(data: bytes) -> bytes:
+    """Swap the two 16-bit words of a 4-byte value; each word keeps its big-endian bytes."""
+    return data[2:4] + data[0:2]
+
+
+def construct_for(var: VarSpec):
+    """The construct that encodes / decodes `var` in its registers, honouring its word order."""
+    if var.value_type == "string":
+        return PaddedString(var.byte_length, "ascii")
+    base = ValueTypeToConstruct[var.value_type]
+    if var.word_order == "little" and var.size == 2:
+        return Transformed(base, _swap_words, 4, _swap_words, 4)
+    return base
+
+
+def raw_value_for(var: VarSpec, value: Any) -> Any:
+    """
+    The register value that encodes the physical `value` of `var`, the inverse of the
+    decode: raw = (physical - offset) / scale_factor, truncated to int for integer types.
+    """
+    if var.value_type in ("float", "sint16", "uint16", "sint32", "uint32"):
+        if var.scale_factor == 0:
+            raise ValueError(f"Scale factor for variable '{var.name}' cannot be zero.")
+        value = (value - var.offset) / var.scale_factor if var.offset else value / var.scale_factor
+    if var.value_type in ("sint16", "uint16", "sint32", "uint32"):
+        # Truncates as before, after dropping the division's float noise
+        # (0.3 / 0.1 = 2.9999999999999996 encodes as 3, not 2).
+        value = int(round(value, 9))
+    return value
 
 
 @dataclass
@@ -289,13 +331,7 @@ class Block:
         """
         Create and compile a construct for vars.
         """
-        fields = {}
-        for var in self.var_specs.values():
-            if var.value_type == "string":
-                # String requires special handling because the size is a variable
-                fields[var.name] = PaddedString(var.byte_length, "ascii")
-            else:
-                fields[var.name] = ValueTypeToConstruct[var.value_type]
+        fields = {var.name: construct_for(var) for var in self.var_specs.values()}
         self._construct = Struct(**fields).compile()
     
 
@@ -376,8 +412,10 @@ class Block:
                     # implemented) -> None, skipping scaling/rounding.
                     val = None
                 elif spec.value_type in ("float", "uint16", "sint16", "sint32", "uint32"):
-                    # Physical value = register_value * scale_factor
+                    # Physical value = register_value * scale_factor + offset
                     val = val * spec.scale_factor
+                    if spec.offset:
+                        val = val + spec.offset
                     # Apply decimal digits formatting if specified
                     val = round(val, spec.decimal_digits) if spec.decimal_digits >= 0 else val
                 new_values[name] = val
@@ -422,14 +460,7 @@ class Block:
                 val = snap.get(v.name)
                 if val is None:
                     raise ValueError(f"Missing value for '{v.name}'.")
-                if v.value_type in ("float", "sint16", "uint16", "sint32", "uint32"):
-                    # register_value =  Physical value/scale_factor
-                    if v.scale_factor == 0:
-                        raise ValueError(f"Scale factor for variable '{v.name}' cannot be zero.")
-                    val = val / v.scale_factor
-                if v.value_type in ("sint16", "uint16", "sint32", "uint32"):
-                    val = int(val)
-                data_to_encode[v.name] = val
+                data_to_encode[v.name] = raw_value_for(v, val)
 
 
             # Encode using construct
@@ -458,6 +489,33 @@ class Block:
             if ok is False:
                 raise RuntimeError("write_coils failed.")
     
+
+    def write_var(self, name: str, *, slave: int = 0) -> None:
+        """
+        Write ONE variable of this output block from its local value, leaving the
+        block's other registers untouched (sync_write() rewrites the whole block).
+        The registers go out through the interface's write path, so a client with
+        single_register_writes sends them as FC06.
+        """
+        if self._iface is None:
+            raise RuntimeError("Modbus interface not assigned.")
+        if self.storage not in ("holding_register", "coil"):
+            raise RuntimeError(f"Cannot write to Modbus area '{self.storage}' (read-only area).")
+        if self.direction != "output":
+            raise RuntimeError(f"Block {self.storage} is not output; refusing to write.")
+        var = self.var_specs[name]
+        _, snap = self.snapshot()
+        val = snap.get(name)
+        if val is None:
+            raise ValueError(f"Missing value for '{name}'.")
+        address = self._addresses()[name]
+        if self.storage == "coil":
+            self._iface.write_coils(address, [bool(val)], slave=slave)
+            return
+        encoded = construct_for(var).build(raw_value_for(var, val))
+        regs = [int.from_bytes(encoded[i:i + 2], byteorder="big") for i in range(0, len(encoded), 2)]
+        self._iface.write_holding_registers(address, regs, slave=slave)
+
 
     def _addresses(self) -> dict[str, int]:
         """
@@ -777,6 +835,27 @@ class ModbusData:
                     return
         raise KeyError(name)
     
+
+    def write_var_value(self, name: str, value: Any, *, slave: int = 0) -> None:
+        """
+        Set an OUTPUT variable and write that variable alone to the device.
+
+        Unlike set_var_value(..., write_now=True), which rewrites its whole block from
+        the local values, the block's other registers are left untouched: safe on maps
+        whose contiguous command registers must not be written together.
+        """
+        for block in self.blocks:
+            if block.direction == "output" and name in block.var_specs:
+                block.set_value(name, value)
+                try:
+                    block.write_var(name, slave=slave)
+                except Exception as e:
+                    self.stats.note_write_failure(e)
+                    raise
+                self.stats.note_write_success()
+                return
+        raise KeyError(name)
+
 
     def apply_defaults_to_local(self, *, outputs_only: bool = True) -> None:
         """

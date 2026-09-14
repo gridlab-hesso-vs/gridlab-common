@@ -67,6 +67,10 @@ class ModbusInterface:
     # Read and write operations for different Modbus data types
     def write_holding_registers(self, address: int, values: list[int], slave: int = 0): ...
     def read_holding_registers(self, address: int, count: int, slave: int = 0) -> list[int]: ...
+
+    def write_holding_register(self, address: int, value: int, slave: int = 0):
+        """Write ONE holding register. Interfaces without a single-register path fall back to write_holding_registers."""
+        return self.write_holding_registers(address, [value], slave=slave)
     
     def write_input_registers(self, address: int, values: list[int], slave: int = 0): ...
     def read_input_registers(self, address: int, count: int, slave: int = 0)  -> list[int]: ...
@@ -85,6 +89,7 @@ class ModbusTCPClient(ModbusInterface):
     port: int = 502
     timeout_s: float = 1.5
     retries: int = 3
+    single_register_writes: bool = False    # True: every holding-register write goes out as FC06 (write single register), one register per request, for devices that reject FC16
 
     def __post_init__(self) -> None:
         self._client = ModbusTcpClient(
@@ -113,7 +118,18 @@ class ModbusTCPClient(ModbusInterface):
     # ----------------------------------
     # Writing functions
     # ----------------------------------
+    def write_holding_register(self, address: int, value: int, slave: int = 0) -> None:
+        response = self._client.write_register(address, value, slave=slave)
+        if response is None or response.isError():
+            raise ModbusWritingFailed(
+                f"write_holding_register failed — {_fail_detail(response, address=address, slave=slave)}"
+            )
+
     def write_holding_registers(self, address: int, values: list[int], slave: int = 0) -> bool:
+        if self.single_register_writes:
+            for offset, value in enumerate(values):
+                self.write_holding_register(address + offset, value, slave=slave)
+            return
         response = self._client.write_registers(address, values, slave=slave)
         if response is None or response.isError():
             raise ModbusWritingFailed(

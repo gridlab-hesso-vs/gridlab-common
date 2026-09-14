@@ -39,6 +39,13 @@ sentinel decodes to None instead of a number, and a variable whose 'Scale ref'
 source is itself not-implemented also decodes to None.
 
 
+Register sheets may also include an 'Offset' column (default blank = 0): the
+physical value is raw * scale factor + offset, and writes apply the inverse. A
+'Word order' column (default blank = 'big') sets the order of the two registers of
+a 32-bit integer or float: 'big' is the Modbus convention (high word at the lower
+address), 'little' the word-swapped layout some devices use (low word first).
+
+
 The main function is `parse_modbusdata_from_xls`.
 
 Fabrizio Sossan
@@ -92,8 +99,9 @@ SHEETS = {
 # Optional columns: recognized on any sheet, not required. Spreadsheets that omit
 # them stay valid. 'Periodic' maps to Block.periodic (refresh cadence); 'Scale ref'
 # and 'Scale mode' map to VarSpec dynamic scaling (register-supplied scale factor);
-# 'Sentinel' maps to VarSpec.sentinel ("not implemented" handling).
-OPTIONAL_COLS = {"Periodic", "Scale ref", "Scale mode", "Sentinel"}
+# 'Sentinel' maps to VarSpec.sentinel ("not implemented" handling); 'Offset' and
+# 'Word order' map to VarSpec.offset and VarSpec.word_order.
+OPTIONAL_COLS = {"Periodic", "Scale ref", "Scale mode", "Sentinel", "Offset", "Word order"}
 
 # Spreadsheet cell values accepted for the optional 'Sentinel' column.
 _SENTINEL_AUTO = {"auto", "default", "sunspec", "yes", "true", "1", "y"}
@@ -106,6 +114,10 @@ _PERIODIC_FALSE = {"false", "0", "no", "n", "once", "static", "init", "one-shot"
 # Spreadsheet cell values accepted for the optional 'Scale mode' column.
 _SCALE_MODE_EXP = {"exponent", "exp", "sunssf", "sf", "pow10"}
 _SCALE_MODE_FAC = {"factor", "mul", "multiplier", "gain"}
+
+# Spreadsheet cell values accepted for the optional 'Word order' column.
+_WORD_ORDER_BIG = {"big", "high first", "high-low", "msw first", "abcd"}
+_WORD_ORDER_LITTLE = {"little", "low first", "low-high", "lsw first", "swapped", "cdab"}
 
 
 def _coerce_periodic(value) -> bool:
@@ -172,6 +184,35 @@ def _coerce_sentinel(value):
         raise ValueError(
             f"Unrecognized 'Sentinel' value: {value!r} (use 'auto', a number, or leave blank)."
         )
+
+
+def _coerce_offset(value) -> float:
+    """Coerce a spreadsheet 'Offset' cell to a number (blank = 0)."""
+    if value is None or pd.isna(value):
+        return 0
+    if isinstance(value, bool):
+        raise ValueError(f"Unrecognized 'Offset' value: {value!r} (use a number).")
+    if isinstance(value, (int, float)):
+        return float(value)
+    s = str(value).strip()
+    if s == "":
+        return 0
+    try:
+        return float(s)
+    except ValueError:
+        raise ValueError(f"Unrecognized 'Offset' value: {value!r} (use a number).") from None
+
+
+def _coerce_word_order(value) -> str:
+    """Coerce a spreadsheet 'Word order' cell to 'big' (default: high word first) or 'little' (low word first)."""
+    if value is None or pd.isna(value):
+        return "big"
+    s = str(value).strip().lower()
+    if s == "" or s in _WORD_ORDER_BIG:
+        return "big"
+    if s in _WORD_ORDER_LITTLE:
+        return "little"
+    raise ValueError(f"Unrecognized 'Word order' value: {value!r} (use 'big' or 'little').")
 
 
 def parse_modbus_area_from_xls(xls_filename: str, area: ModbusArea, *, invert_rw: bool = False, register_offset: int = 0) -> pd.DataFrame:
@@ -324,6 +365,8 @@ def add_register_var(
     min_val=None,
     max_val=None,
     notes: str | None = None,
+    offset: float = 0,
+    word_order: str = "big",
 ) -> None:
     vt = str(var_type).lower()
     if vt == "array":
@@ -342,6 +385,8 @@ def add_register_var(
             sentinel=sentinel,
             min_val=min_val,
             max_val=max_val,
+            offset=offset,
+            word_order=word_order,
             notes=notes if notes is not None else "",
         )
     )
@@ -411,6 +456,8 @@ def create_blocks_from_df(df: pd.DataFrame, area: ModbusArea, fill_gaps: bool = 
             scale_ref = _coerce_scale_ref(row.get("Scale ref", None))
             scale_mode = _coerce_scale_mode(row.get("Scale mode", None))
             sentinel = _coerce_sentinel(row.get("Sentinel", None))
+            offset = _coerce_offset(row.get("Offset", None))
+            word_order = _coerce_word_order(row.get("Word order", None))
 
             min_val = row.get("Min value", None)
             if pd.isna(min_val):
@@ -434,6 +481,8 @@ def create_blocks_from_df(df: pd.DataFrame, area: ModbusArea, fill_gaps: bool = 
                 sentinel=sentinel,
                 min_val=min_val,
                 max_val=max_val,
+                offset=offset,
+                word_order=word_order,
                 notes=row_notes,
             )
         else:
