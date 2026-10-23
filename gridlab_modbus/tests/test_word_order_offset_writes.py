@@ -16,15 +16,13 @@ from gridlab_modbus.modbus_data_model import Block, ModbusData, VarSpec
 from gridlab_modbus.modbus_tcp import ModbusTCPClient, ModbusTCPServer
 from gridlab_modbus.modbus_xls_parser import parse_modbusdata_from_xls
 
-HOLDING = 3
-
 
 def store() -> ModbusTCPServer:
     return ModbusTCPServer(host="127.0.0.1", port=0)
 
 
 def words(server: ModbusTCPServer, address: int, count: int) -> list[int]:
-    return list(server._context[0].getValues(HOLDING, address, count))
+    return server.read_holding_registers(address, count)
 
 
 def block_of(server: ModbusTCPServer, direction: str, *specs: VarSpec, address: int = 100) -> Block:
@@ -135,7 +133,7 @@ def test_write_var_value_on_a_coil_block_writes_that_coil_only():
 
     data.write_var_value("b", True)
     data.write_var_value("a", False)
-    assert [bool(x) for x in srv._context[0].getValues(1, 10, 3)] == [False, True, True]
+    assert srv.read_coils(10, 3) == [False, True, True]
 
 
 # ---- single-register writes (FC06) ----
@@ -150,11 +148,11 @@ class _RecordingPymodbusClient:
     def __init__(self):
         self.calls = []
 
-    def write_register(self, address, value, slave=1):
+    def write_register(self, address, value, device_id=1):
         self.calls.append(("fc06", address, value))
         return self._Ok()
 
-    def write_registers(self, address, values, slave=1):
+    def write_registers(self, address, values, device_id=1):
         self.calls.append(("fc16", address, list(values)))
         return self._Ok()
 
