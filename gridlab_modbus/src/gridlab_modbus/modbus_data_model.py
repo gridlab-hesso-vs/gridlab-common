@@ -371,36 +371,10 @@ class Block:
             elif self.storage == "input_register":
                 reader = self._iface.read_input_registers
             
-            regs: list[int] = reader(self.initial_address, self.count, slave=slave)
-            if regs is None:
-                raise ModbusReadingFailed("Could not read register block from Modbus interface.")
+            regs = self._complete_reply(reader(self.initial_address, self.count, slave=slave), slave=slave)
             byte_buffer = b"".join(r.to_bytes(2, "big") for r in regs)
-            expected_len = self.count * 2
-            
-            
-
-            try:
-                # NOTE: this line is prone to failing sometimes
-                decoded_data = self._construct.parse(byte_buffer)
-            except Exception as e:
-
-                log.error(
-                    "================================\n"
-                    f"storage={self.storage}\n"
-                    f"slave={slave}\n"
-                    f"address={self.initial_address}\n"
-                    f"count={self.count}\n"
-                    f"regs={regs}\n"
-                    f"byte_buffer={byte_buffer!r}\n"
-                    f"byte_len={len(byte_buffer)}\n"
-                    f"parser={self._construct}\n"
-                    f"Error: {e}\n"
-                    "================================"
-                )
-
-                self._iface.close()
-                self._iface.open()
-                raise
+            # Only a full buffer is decoded; one that does not decode propagates as raised.
+            decoded_data = self._construct.parse(byte_buffer)
 
             new_values: dict[str, Any] = {}
 
@@ -429,11 +403,25 @@ class Block:
             elif self.storage == "discrete_input":
                 reader = self._iface.read_discrete_inputs
             
-            bits = reader(self.initial_address, self.count, slave=slave)
+            bits = self._complete_reply(reader(self.initial_address, self.count, slave=slave), slave=slave)
             new_values: dict[str, Any] = {}
             for v, b in zip(self.var_specs.values(), bits):
                 new_values[v.name] = bool(b)
             self._publish(new_values)
+
+    def _complete_reply(self, values: list | None, *, slave: int) -> list:
+        """
+        The block's `count` values of a read reply. A missing or short reply is a failed
+        read (ModbusReadingFailed, a comms failure to the caller), never decoded: a block
+        of N registers given fewer (a late reply taken for this one, a server answering a
+        range it does not serve) must not decode a partial buffer, whatever the interface.
+        """
+        if values is None or len(values) < self.count:
+            raise ModbusReadingFailed(
+                f"read {self.storage} failed — address={self.initial_address}, count={self.count}, slave={slave}: "
+                f"short reply ({0 if values is None else len(values)} of {self.count})"
+            )
+        return values[:self.count]
 
 
     def sync_write(self, *, slave: int = 0) -> None:
