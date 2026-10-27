@@ -25,10 +25,22 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Iterator, Tuple
 
 from threading import RLock
+from pymodbus.exceptions import ModbusException
 from .modbus_tcp import ModbusInterface, ModbusTCPClient, ModbusReadingFailed
 
 from loguru import logger
 log = logger
+
+# Most registers / bits one Modbus request may carry (FC03/04 and FC16, FC01/02 and FC15).
+# A larger block is read or written in several requests, cut between variables.
+MAX_READ_REGISTERS = 125
+MAX_WRITE_REGISTERS = 123
+MAX_READ_BITS = 2000
+MAX_WRITE_BITS = 1968
+
+# A read that failed on the link or at the device, which ModbusData.sync_read(partial=True)
+# records and moves past. Anything else (a bug, a reply that does not decode) still raises.
+READ_FAILURES = (ModbusReadingFailed, ModbusException, OSError)
 
 ModbusArea = Literal["holding_register", "input_register", "coil", "discrete_input"]
 Direction = Literal["input", "output"]
@@ -247,7 +259,13 @@ class Block:
             self.var_values = new_values
             self._version += 1
             if self._version > 1_000_000_000:
-                self._version = 0  
+                self._version = 0
+
+    def clear_values(self) -> None:
+        """
+        Set every variable to None (not read), atomically and with a version bump.
+        """
+        self._publish({name: None for name in self.var_specs})
 
     def __post_init__(self):
         """
@@ -371,7 +389,9 @@ class Block:
             elif self.storage == "input_register":
                 reader = self._iface.read_input_registers
             
-            regs = self._complete_reply(reader(self.initial_address, self.count, slave=slave), slave=slave)
+            regs: list[int] = []
+            for address, count in self._requests(MAX_READ_REGISTERS):
+                regs += self._complete_reply(reader(address, count, slave=slave), address=address, count=count, slave=slave)
             byte_buffer = b"".join(r.to_bytes(2, "big") for r in regs)
             # Only a full buffer is decoded; one that does not decode propagates as raised.
             decoded_data = self._construct.parse(byte_buffer)
@@ -403,25 +423,44 @@ class Block:
             elif self.storage == "discrete_input":
                 reader = self._iface.read_discrete_inputs
             
-            bits = self._complete_reply(reader(self.initial_address, self.count, slave=slave), slave=slave)
+            bits: list[bool] = []
+            for address, count in self._requests(MAX_READ_BITS):
+                bits += self._complete_reply(reader(address, count, slave=slave), address=address, count=count, slave=slave)
             new_values: dict[str, Any] = {}
             for v, b in zip(self.var_specs.values(), bits):
                 new_values[v.name] = bool(b)
             self._publish(new_values)
 
-    def _complete_reply(self, values: list | None, *, slave: int) -> list:
+    def _requests(self, limit: int) -> list[tuple[int, int]]:
         """
-        The block's `count` values of a read reply. A missing or short reply is a failed
+        The (address, count) requests covering the block, at most `limit` registers (or bits)
+        each and cut between variables, so that no value is split over two requests. A block
+        within the limit is one request, as before; a larger one, being several requests, is
+        not one snapshot of the device, and a failed write may leave its first requests written.
+        """
+        requests: list[tuple[int, int]] = []
+        address, count = self.initial_address, 0
+        for v in self.var_specs.values():
+            if count and count + v.size > limit:
+                requests.append((address, count))
+                address, count = address + count, 0
+            count += v.size
+        requests.append((address, count))
+        return requests
+
+    def _complete_reply(self, values: list | None, *, address: int, count: int, slave: int) -> list:
+        """
+        The `count` values of one read reply. A missing or short reply is a failed
         read (ModbusReadingFailed, a comms failure to the caller), never decoded: a block
         of N registers given fewer (a late reply taken for this one, a server answering a
         range it does not serve) must not decode a partial buffer, whatever the interface.
         """
-        if values is None or len(values) < self.count:
+        if values is None or len(values) < count:
             raise ModbusReadingFailed(
-                f"read {self.storage} failed — address={self.initial_address}, count={self.count}, slave={slave}: "
-                f"short reply ({0 if values is None else len(values)} of {self.count})"
+                f"read {self.storage} failed — address={address}, count={count}, slave={slave}: "
+                f"short reply ({0 if values is None else len(values)} of {count})"
             )
-        return values[:self.count]
+        return values[:count]
 
 
     def sync_write(self, *, slave: int = 0) -> None:
@@ -458,9 +497,11 @@ class Block:
                 int.from_bytes(encoded[i:i+2], byteorder="big")
                 for i in range(0, len(encoded), 2)
             ]
-            ok = self._iface.write_holding_registers(self.initial_address, regs, slave=slave)
-            if ok is False:
-                raise RuntimeError("write_holding_registers failed.")
+            for address, count in self._requests(MAX_WRITE_REGISTERS):
+                start = address - self.initial_address
+                ok = self._iface.write_holding_registers(address, regs[start:start + count], slave=slave)
+                if ok is False:
+                    raise RuntimeError("write_holding_registers failed.")
         
         elif self.storage == "coil":
             # Write coils as bits
@@ -472,10 +513,12 @@ class Block:
                 if v.size != 1:
                     raise ValueError(f"Coil '{v.name}' must have size 1 (got {v.size}).")
                 bits.append(bool(val))
-            
-            ok = self._iface.write_coils(self.initial_address, bits, slave=slave)
-            if ok is False:
-                raise RuntimeError("write_coils failed.")
+
+            for address, count in self._requests(MAX_WRITE_BITS):
+                start = address - self.initial_address
+                ok = self._iface.write_coils(address, bits[start:start + count], slave=slave)
+                if ok is False:
+                    raise RuntimeError("write_coils failed.")
     
 
     def write_var(self, name: str, *, slave: int = 0) -> None:
@@ -753,7 +796,18 @@ class ModbusData:
 
 
     # --- synchronization commands
-    def sync_read(self, *, slave: int = 0, read_all: bool = False, force: bool = False) -> None:
+    def sync_read(self, *, slave: int = 0, read_all: bool = False, force: bool = False,
+                  partial: bool = False) -> list[tuple["Block", Exception]]:
+        """
+        Read the blocks due this cycle. By default a failed read raises at the first block
+        that fails, and the blocks after it are not read.
+
+        With partial=True, a read failure (READ_FAILURES) does not stop the cycle: every
+        block is read, a failed block's values are cleared to None (never left over from an
+        earlier cycle), and the failures are returned as (block, exception) pairs. Each failed
+        block costs its full timeout, so a dead link takes one timeout per block to report.
+        """
+        failures: list[tuple[Block, Exception]] = []
         for block in self.blocks:
             if not block.periodic and not force:
                 continue  # one-shot block: read once at init (force=True), skip in the periodic loop
@@ -763,8 +817,12 @@ class ModbusData:
                     self.stats.note_read_success()
                 except Exception as e:
                     self.stats.note_read_failure(e)
-                    raise
+                    if not (partial and isinstance(e, READ_FAILURES)):
+                        raise
+                    block.clear_values()
+                    failures.append((block, e))
         self._maybe_print_stats()
+        return failures
 
     
     def sync_write(self, slave: int = 0, force: bool = False) -> None:

@@ -27,8 +27,20 @@ from pymodbus.client import ModbusTcpClient
 import time
 from dataclasses import dataclass
 
-class ModbusReadingFailed(RuntimeError): ...
-class ModbusWritingFailed(RuntimeError): ...
+class _ModbusFailure(RuntimeError):
+    """
+    A failed request. `exception_code` is the Modbus exception code the device
+    answered with (6 = SlaveDeviceBusy, ...), None when there was no exception
+    answer (no response, a short reply). The message is unchanged by it.
+    """
+
+    def __init__(self, *args, exception_code: int | None = None):
+        super().__init__(*args)
+        self.exception_code = exception_code
+
+
+class ModbusReadingFailed(_ModbusFailure): ...
+class ModbusWritingFailed(_ModbusFailure): ...
 
 
 # Modbus protocol exception codes (function-code error responses), for diagnostics.
@@ -59,6 +71,13 @@ def _fail_detail(response, *, address: int, slave: int, count: int | None = None
     if code is not None:
         return f"{where}: exception_code={code} ({_MODBUS_EXCEPTION_CODES.get(code, 'Unknown')})"
     return f"{where}: {response!r}"
+
+
+def _exception_code(response) -> int | None:
+    """The Modbus exception code of an exception answer; None for no response or any other reply."""
+    if response is None or not response.isError():
+        return None
+    return getattr(response, "exception_code", None)
 
 
 def _complete_reply(values: list, what: str, *, address: int, count: int, slave: int) -> list:
@@ -139,7 +158,8 @@ class ModbusTCPClient(ModbusInterface):
         response = self._client.write_register(address, value, device_id=slave)
         if response is None or response.isError():
             raise ModbusWritingFailed(
-                f"write_holding_register failed — {_fail_detail(response, address=address, slave=slave)}"
+                f"write_holding_register failed — {_fail_detail(response, address=address, slave=slave)}",
+                exception_code=_exception_code(response),
             )
 
     def write_holding_registers(self, address: int, values: list[int], slave: int = 0) -> bool:
@@ -150,7 +170,8 @@ class ModbusTCPClient(ModbusInterface):
         response = self._client.write_registers(address, values, device_id=slave)
         if response is None or response.isError():
             raise ModbusWritingFailed(
-                f"write_holding_registers failed — {_fail_detail(response, address=address, count=len(values), slave=slave)}"
+                f"write_holding_registers failed — {_fail_detail(response, address=address, count=len(values), slave=slave)}",
+                exception_code=_exception_code(response),
             )
 
 
@@ -158,7 +179,8 @@ class ModbusTCPClient(ModbusInterface):
         response = self._client.write_coils(address, values, device_id=slave)
         if response is None or response.isError():
             raise ModbusWritingFailed(
-                f"write_coils failed — {_fail_detail(response, address=address, count=len(values), slave=slave)}"
+                f"write_coils failed — {_fail_detail(response, address=address, count=len(values), slave=slave)}",
+                exception_code=_exception_code(response),
             )
 
 
@@ -169,7 +191,8 @@ class ModbusTCPClient(ModbusInterface):
         response = self._client.read_holding_registers(address, count=count, device_id=slave)
         if not response or response.isError() or response.registers is None:
             raise ModbusReadingFailed(
-                f"read_holding_registers failed — {_fail_detail(response, address=address, count=count, slave=slave)}"
+                f"read_holding_registers failed — {_fail_detail(response, address=address, count=count, slave=slave)}",
+                exception_code=_exception_code(response),
             )
         return _complete_reply(list(response.registers), "read_holding_registers", address=address, count=count, slave=slave)
 
@@ -177,7 +200,8 @@ class ModbusTCPClient(ModbusInterface):
         response = self._client.read_input_registers(address, count=count, device_id=slave)
         if not response or response.isError() or response.registers is None:
             raise ModbusReadingFailed(
-                f"read_input_registers failed — {_fail_detail(response, address=address, count=count, slave=slave)}"
+                f"read_input_registers failed — {_fail_detail(response, address=address, count=count, slave=slave)}",
+                exception_code=_exception_code(response),
             )
         return _complete_reply(list(response.registers), "read_input_registers", address=address, count=count, slave=slave)
 
@@ -185,7 +209,8 @@ class ModbusTCPClient(ModbusInterface):
         response = self._client.read_coils(address, count=count, device_id=slave)
         if not response or response.isError() or response.bits is None:
             raise ModbusReadingFailed(
-                f"read_coils failed — {_fail_detail(response, address=address, count=count, slave=slave)}"
+                f"read_coils failed — {_fail_detail(response, address=address, count=count, slave=slave)}",
+                exception_code=_exception_code(response),
             )
         # Pymodbus pads the bits to a whole byte: keep the first `count`, refuse fewer.
         bits = _complete_reply(list(response.bits), "read_coils", address=address, count=count, slave=slave)
@@ -196,7 +221,8 @@ class ModbusTCPClient(ModbusInterface):
         response = self._client.read_discrete_inputs(address, count=count, device_id=slave)
         if not response or response.isError() or response.bits is None:
             raise ModbusReadingFailed(
-                f"read_discrete_inputs failed — {_fail_detail(response, address=address, count=count, slave=slave)}"
+                f"read_discrete_inputs failed — {_fail_detail(response, address=address, count=count, slave=slave)}",
+                exception_code=_exception_code(response),
             )
         # Pymodbus pads the bits to a whole byte: keep the first `count`, refuse fewer.
         bits = _complete_reply(list(response.bits), "read_discrete_inputs", address=address, count=count, slave=slave)
