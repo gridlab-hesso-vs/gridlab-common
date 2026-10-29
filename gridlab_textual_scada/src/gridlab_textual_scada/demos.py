@@ -96,8 +96,8 @@ class AllWidgetsDemo(TabbedApp):
             yield RegisterEditorTS('TS', 1, lambda x: self.log_to_console(f"Register set to {x}"))
 
             yield StaticBlock('Displays')
-            yield CoilDisplay('CoilDisplay', lambda : (random.uniform(1, 10) >= 5.0))
-            yield RegisterDisplay('RegisterDisplay', 1, lambda : random.uniform(1, 10))
+            yield CoilDisplay('CoilDisplay', lambda : (random.uniform(1, 10) >= 5.0), auto_update=True)
+            yield RegisterDisplay('RegisterDisplay', 1, lambda : random.uniform(1, 10), auto_update=True)
 
 
 def main():

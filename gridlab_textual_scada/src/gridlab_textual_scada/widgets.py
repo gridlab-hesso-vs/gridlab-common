@@ -11,20 +11,25 @@ Custom widgets for Textualize-based SCADA applications:
 - SButton: A simple button that triggers an action without maintaining a state.
 - MySlider: A slider widget for selecting a numerical value within a range.
 - NumericalDialog: Modal dialog for entering a number.
+
+Action functions (action_func) are called with the value to send. A submission fails if the action function raises
+an exception or returns False: any other return value, None included, is a success. Errors are logged to the console.
+
+Widgets registered for periodic updates are updated by TabbedApp from its update thread: update_widget reads the new
+value there (so it may block, e.g. on I/O), then changes the widget in the UI thread, as Textual widgets are not
+thread-safe.
 """
 
-from abc import abstractmethod
 from textual.app import ComposeResult
 from textual.containers import Horizontal, Vertical, Container, Grid
 from textual.widget import Widget
 from textual.widgets import Button, Label, Static, Digits, Input
 from textual_slider import Slider
-from textual._context import active_app
 from textual.screen import ModalScreen
 from textual import work
 
 
-class NumericalDialog(ModalScreen[bool]):
+class NumericalDialog(ModalScreen[str | None]):
     ''' Dialog where the user can input a number '''
     DEFAULT_CSS = '''
     /* Center the dialog within the full-screen overlay */
@@ -108,31 +113,51 @@ class NumericalDialog(ModalScreen[bool]):
 class _MyComponent(Widget):
     ''' Base class for a SCADA widget '''
 
-    # Keep track of all allocated components
-    _instances = []
-    def get_all_instances():
-        return list(_MyComponent._instances)
-
-
     def __init__(self, name, tooltip: str, **kwargs):
         super().__init__(**kwargs)
-        _MyComponent._instances.append(self)
         self._name = name
-        self._tooltip_text = None
-        if isinstance(tooltip, str):
-            self._tooltip_text = tooltip
+        self._auto_update = False
+        self._submit_value_func = None
+        if tooltip:
+            self.tooltip = tooltip
 
     def log_to_console(self, text):
         self.app.log_to_console(f"[{self._name}] {text}")
 
-    @abstractmethod
     def update_widget(self):
-        # Function called periodically to update the state of the widget. To be implemented in the derived class.
+        '''
+        Function called periodically, in the update thread, to update the state of the widget. To be implemented in
+        the derived class: read the new state here (it may block), then change the widget with _run_in_ui_thread.
+        '''
         pass
 
     def set_tooltip(self, text: str):
         ''' Assign tooltip text to the widget '''
-        self._tooltip_text = text
+        self.tooltip = text
+
+    def on_mount(self) -> None:
+        if self._auto_update:
+            self.app._add_widget_to_update(self)
+
+    def on_unmount(self) -> None:
+        # Stop updating a widget that is no longer displayed
+        if self._auto_update:
+            self.app._remove_widget_to_update(self)
+
+    def _run_in_ui_thread(self, func: callable, *args) -> None:
+        """Run func(*args) in the UI thread, from any thread (see TabbedApp.run_in_ui_thread)."""
+        self.app.run_in_ui_thread(func, *args)
+
+    def _submit(self, *args) -> bool:
+        """
+        Call the action function with args, and return whether it succeeded: it failed if it raised an exception
+        (which is logged) or returned False. Any other return value, None included, is a success.
+        """
+        try:
+            return self._submit_value_func(*args) is not False
+        except Exception as e:
+            self._log_exception(self._name, e)
+            return False
 
     def _set_single_class(self, widget: Widget, target_class: str, candidate_classes: tuple[str, ...]) -> None:
         """Apply exactly one class from a known set to the given widget."""
@@ -145,9 +170,10 @@ class _MyComponent(Widget):
         self.log_to_console(f'Error with {context}: {error}')
 
     def _register_auto_update(self, auto_update: bool) -> None:
-        """Register this widget for periodic updates when requested."""
-        if auto_update:
-            active_app.get()._add_widget_to_update(self)
+        """Register this widget for periodic updates when requested: now if mounted, otherwise when mounted."""
+        self._auto_update = auto_update
+        if auto_update and self.is_mounted:
+            self.app._add_widget_to_update(self)
 
     @staticmethod
     def _format_numeric(value: float, decimal_digits: int) -> str:
@@ -204,11 +230,23 @@ class Switch(_MyComponent):
     }
     '''
 
-    def __init__(self, name, action_func: callable, tooltip: str = None, **kwargs):
+    def __init__(self,
+                 name,
+                 action_func: callable,
+                 tooltip: str = None,
+                 update_func: callable = None,
+                 auto_update: bool = False,
+                 **kwargs):
+        '''
+        action_func(value) is called with 1 or 0 when the switch is pressed. The switch changes state only if it succeeds.
+        update_func: None -> bool, optional, reads the actual state to display (e.g. from the device), with auto_update=True.
+        '''
         super().__init__(name, tooltip, **kwargs)
         self._button = Button(name, classes='buttonsw regularsw')
         self._button.active_effect_duration = 0.0
         self._submit_value_func = action_func
+        self._update_display_func = update_func
+        self._register_auto_update(auto_update)
 
 
     def compose(self) -> ComposeResult:
@@ -216,16 +254,24 @@ class Switch(_MyComponent):
 
     def on_button_pressed(self, event) -> None:
         """
-        Toggle the style of the button (active if inactive, and viceversa) and call
-        the submit value function associated to the button.
+        Toggle the switch (active if inactive, and viceversa): call the submit value function associated to the
+        button with the new state, and show the new state only if the submission succeeded.
         """
-        try:
-            if self._button.has_class('activesw'):
-                self.set_inactive_style()
-                self._submit_value_func(0)
-            else:
+        new_value = 0 if self._button.has_class('activesw') else 1
+        if self._submit(new_value):
+            if new_value:
                 self.set_active_style()
-                self._submit_value_func(1)
+            else:
+                self.set_inactive_style()
+
+    def update_widget(self):
+        """ Show the state read with update_func, if any. """
+        if self._update_display_func is None:
+            return
+        try:
+            value = self._update_display_func()
+            if value is not None:
+                self._run_in_ui_thread(self.set_active_style if value else self.set_inactive_style)
         except Exception as e:
             self._log_exception(self._name, e)
 
@@ -263,14 +309,13 @@ class SButton(_MyComponent):
         yield self._button
 
     def on_button_pressed(self, event) -> None:
-        try:
-            self._submit_value_func()
-        except Exception as e:
-            self._log_exception(self._name, e)
+        self._submit()
 
 
 class PushButton(_MyComponent):
-    ''' Pushbutton for controlling boolean values. On for a few seconds when pressed. '''
+    ''' Pushbutton for controlling boolean values. On for PULSE_DURATION_S seconds when pressed. '''
+
+    PULSE_DURATION_S = 1.5
 
     DEFAULT_CSS = '''
     PushButton {
@@ -302,24 +347,28 @@ class PushButton(_MyComponent):
         self._button = Button(name, classes='buttonpb regularpb')
         self._button.active_effect_duration = 0.0
         self._submit_value_func = action_func
+        self._pulsing = False
 
     def compose(self) -> ComposeResult:
         yield self._button
 
     def on_button_pressed(self, event) -> None:
-        """ As a push button, I set a 1 and clear the state (set a 0) after 0.8 sec. """
-        if self._button.has_class('activepb'):
-            # Ignore the event if the button is already active
+        """
+        As a push button, I set a 1 and clear the state (set a 0) after PULSE_DURATION_S seconds.
+        The 0 is sent even if sending the 1 failed (after a timeout, the device may have received it anyway), so that
+        a failed write never leaves the output at 1. The button is lit only if the 1 was sent.
+        """
+        if self._pulsing:
+            # Ignore the event if a pulse is already in progress
             return
         def clear_active_state():
+            self._submit(0)
             self._set_single_class(self._button, 'regularpb', ('regularpb', 'activepb'))
-            self._submit_value_func(0)
-        try:
+            self._pulsing = False
+        self._pulsing = True
+        self.set_timer(self.PULSE_DURATION_S, clear_active_state)
+        if self._submit(1):
             self._set_single_class(self._button, 'activepb', ('regularpb', 'activepb'))
-            self._submit_value_func(1)
-            self.set_timer(1.5, clear_active_state)
-        except Exception as e:
-            self._log_exception(self._name, e)
 
 
 class CoilDisplay(_MyComponent):
@@ -354,6 +403,7 @@ class CoilDisplay(_MyComponent):
                  **kwargs):
         '''
         update_func: None -> bool is the function called when updating the display.
+        invert: show the opposite of the value returned by update_func.
         '''
         super().__init__(name, tooltip, **kwargs)
         self._update_display_func = update_func
@@ -367,15 +417,18 @@ class CoilDisplay(_MyComponent):
         yield self._container
 
     def update_widget(self):
+        """ Read the value (in the update thread) and show its colour (in the UI thread). """
         try:
             value = self._update_display_func()
-            self.log_to_console(f'{self._name} value:  {value}')
+            if self._invert and isinstance(value, bool):
+                value = not value
             if value is True:
-                self._set_single_class(self._container, 'true', ('undefined', 'false', 'true'))
+                state = 'true'
             elif value is False:
-                self._set_single_class(self._container, 'false', ('undefined', 'false', 'true'))
+                state = 'false'
             else:
-                self._set_single_class(self._container, 'undefined', ('undefined', 'false', 'true'))
+                state = 'undefined'
+            self._run_in_ui_thread(self._set_single_class, self._container, state, ('undefined', 'false', 'true'))
         except Exception as e:
             self._log_exception(self._name, e)
 
@@ -402,18 +455,22 @@ class MySlider(_MyComponent):
     }
     '''
 
-    def __init__(self, name: str, min_val: int, max_val: int, step: int, tooltip: str = None, **kwargs):
+    def __init__(self, name: str, min_val: int, max_val: int, step: int, tooltip: str = None, action_func: callable = None, **kwargs):
+        ''' action_func(value), optional, is called with the new value each time the slider moves. '''
         super().__init__(name, tooltip, **kwargs)
         self._min_val = min_val
         self._max_val = max_val
         self._step = step
-        self._register_label = Static('#VALUE#', classes='cur_value')
+        self._submit_value_func = action_func
+        self._register_label = Static(str(min_val), classes='cur_value')
 
 
     def on_slider_changed(self, event):
         val = self.slider.value
         self.log_to_console(f'Slider {self._name} value changed to {val}')
         self._register_label.update(str(val))
+        if self._submit_value_func is not None:
+            self._submit(val)
 
     def compose(self) -> ComposeResult:
         with Container(classes='v'):
@@ -421,7 +478,7 @@ class MySlider(_MyComponent):
                 yield Static(f"{self._name}: ", classes='label')
                 yield self._register_label
         with Container(classes='v'):
-            self.slider = Slider(min=self._min_val, max=self._max_val, step=self._step, value=0, classes='cur_value')
+            self.slider = Slider(min=self._min_val, max=self._max_val, step=self._step, value=self._min_val, classes='cur_value')
             yield self.slider
 
 
@@ -475,11 +532,11 @@ class RegisterDisplay(_MyComponent):
             yield self._register_label
 
     def update_widget(self):
-        """ Update the display of the value """
+        """ Read the value (in the update thread) and display it (in the UI thread). """
         try:
             val = self._update_display_func()
             val = self._format_numeric(val, self._decimal_digits)
-            self._register_label.update(val)
+            self._run_in_ui_thread(self._register_label.update, val)
         except Exception as e:
             self._log_exception(self._name, e)
 
@@ -535,7 +592,7 @@ class RegisterEditor(_MyComponent):
     def __init__(self,
                  name: str,
                  decimal_digits: int,
-                 action_func: callable=lambda:None,
+                 action_func: callable=lambda value: None,
                  init_value: float=None,
                  tooltip: str = None,
                  **kwargs):
@@ -545,25 +602,34 @@ class RegisterEditor(_MyComponent):
         self._register_input = None
         self._initial_value = init_value
         self._var = None
+        self._get_value_func = None
 
 
     def force_update_function(self, get_value_func: callable):
         """
         Set a function that will be called to update the value of the register editor.
         This is useful if the value of the register may change from outside the editor.
+        The value is not updated while the user is editing it (i.e., while the input field has the focus).
         """
-        def func():
-            """ Update the display of the value """
-            try:
-                val = get_value_func()
-                self._register_input.value = self._format_numeric(val, self._decimal_digits)
-                # TODO: any animation here?
-            except Exception as e:
-                self._log_exception(self._name, e)
-
-        # Override the update_widget method to call this function
-        self.update_widget = func
+        self._get_value_func = get_value_func
         self._register_auto_update(True)
+
+
+    def update_widget(self):
+        """ Read the value with the function set by force_update_function (in the update thread), and display it (in the UI thread). """
+        if self._get_value_func is None:
+            return
+        try:
+            val = self._format_numeric(self._get_value_func(), self._decimal_digits)
+            self._run_in_ui_thread(self._show_value, val)
+        except Exception as e:
+            self._log_exception(self._name, e)
+
+
+    def _show_value(self, val: str):
+        """ Show val in the input field, unless the user is editing it. """
+        if not self._register_input.has_focus:
+            self._register_input.value = val
 
 
 
@@ -579,24 +645,17 @@ class RegisterEditor(_MyComponent):
 
     def on_submit(self, event):
         """
-        Function called when the Set button of the RegisterEditor is pressed: it reads the value from the input field,
-        converts it to a float, and calls the action function passed to the constructor.
-        Exception and errors are printed to the console.
+        Function called when the Set button of the RegisterEditor is pressed (or Enter in the input field): it reads
+        the value from the input field, converts it to a float, validates it, and calls the action function passed to
+        the constructor. Errors are printed to the console, and the input field turns green or red.
         """
-        try:
-            target_value = self._register_input.value
-            if not register_editor_value_validator(target_value, self._var):
-                self.give_submit_feedback(False)
-                self.log_to_console(f'Value {target_value} is not valid for variable {self._name}.')
-                return
-            if len(target_value) == 0:
-                self.give_submit_feedback(False)
-                return
-            target_value = float(target_value)
-            success = self._submit_value_func(target_value)
-            self.give_submit_feedback(success)
-        except Exception as e:
-            self._log_exception(self._name, e)
+        text = self._register_input.value
+        value = _parse_register_value(text, self._var)
+        if value is None:
+            self.log_to_console(f'Value {text} is not valid for variable {self._name}.')
+            self.give_submit_feedback(False)
+            return
+        self.give_submit_feedback(self._submit(value))
 
 
     def give_submit_feedback(self, success: bool):
@@ -659,7 +718,7 @@ class RegisterEditorTS(_MyComponent):
     def __init__(self,
                  name: str,
                  decimal_digits: int,
-                 action_func: callable=lambda:None,
+                 action_func: callable=lambda value: None,
                  init_value: float=None,
                  tooltip: str = None,
                  **kwargs):
@@ -684,17 +743,23 @@ class RegisterEditorTS(_MyComponent):
 
     @work
     async def on_button_pressed(self, event) -> None:
-        val = await self.app.push_screen_wait(NumericalDialog(title=self._name))
-        val = float(val) if val is not None else None
-        if val is not None:
-            if not register_editor_value_validator(val, self._var):
-                self.log_to_console(f'Value {val} is not valid for variable {self._name}.')
-                self.give_submit_feedback(False)
-            else:
-                self._set_value(val)
-                self._submit_value_func(val)
-                # Parse success? See above.
-                self.give_submit_feedback(True)
+        """
+        Ask the value with a numeric dialog, validate it, and call the action function passed to the constructor.
+        Errors are printed to the console, and the button turns green or red. The value shown changes only on success.
+        """
+        text = await self.app.push_screen_wait(NumericalDialog(title=self._name))
+        if text is None:
+            # Cancelled by the user
+            return
+        value = _parse_register_value(text, self._var)
+        if value is None:
+            self.log_to_console(f'Value {text} is not valid for variable {self._name}.')
+            self.give_submit_feedback(False)
+            return
+        success = self._submit(value)
+        if success:
+            self._set_value(value)
+        self.give_submit_feedback(success)
 
 
     def assign_var(self, var):
@@ -733,3 +798,16 @@ def register_editor_value_validator(value, var) -> bool:
     if var.max_val is not None and value > var.max_val:
         return False
     return True
+
+
+def _parse_register_value(text: str, var) -> float | None:
+    """
+    Convert the text entered in a register editor to a float, or return None if it is not a number or not valid for `var`.
+    The text is converted to float before validation, as registers hold physical values: e.g., a register of an
+    integer type with a scale factor of 0.1 can hold 12.7, which int('12.7') would reject.
+    """
+    try:
+        value = float(text)
+    except ValueError:
+        return None
+    return value if register_editor_value_validator(value, var) else None

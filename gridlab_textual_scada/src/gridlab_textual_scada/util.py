@@ -4,7 +4,6 @@ external dependencies just to use the package.
 """
 
 import random
-import socket
 import threading
 import time
 
@@ -17,6 +16,9 @@ class PeriodicTask:
 
     Drift-compensating: if a tick takes longer than the period, the next
     tick fires immediately rather than accumulating skew.
+
+    `func` should handle its own errors: an exception escaping it is dropped,
+    so that the task keeps running.
     """
 
     def __init__(self, func: callable, period_s: float, thread_name: str = "PeriodicTask"):
@@ -33,7 +35,7 @@ class PeriodicTask:
 
     def _run(self) -> None:
         # Stagger startup so multiple tasks don't fire on the same tick.
-        time.sleep(random.uniform(0, self._period_s))
+        self._stop.wait(random.uniform(0, self._period_s))
         next_deadline = time.monotonic()
         while not self._stop.is_set():
             try:

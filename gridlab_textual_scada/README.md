@@ -4,8 +4,10 @@ Custom [Textual](https://github.com/Textualize/textual) widgets and a tabbed-app
 
 ## Install
 
+From the repo root:
+
 ```sh
-pip install -e pythonlib/gridlab-textual-scada
+pip install -e gridlab_textual_scada
 ```
 
 ## Use
@@ -20,6 +22,12 @@ class MyApp(TabbedApp):
 MyApp().run()
 ```
 
+Widgets that send a value call their `action_func` with it. A submission fails if `action_func` raises an exception or returns `False`: any other return value, `None` included, is a success. Errors are shown in the log console.
+
+## Threads
+
+`TabbedApp` updates the UI every `update_period_sec` from a background thread, so that reading values (`update_func`, `custom_update`, `update_ui_tab`) may block, e.g. on I/O, without freezing the UI. Textual widgets must only be changed in the UI thread: the widgets of this package take care of it, while in `custom_update` and `update_ui_tab` change widgets via `run_in_ui_thread(func, *args)`. `log_to_console` can be called from any thread.
+
 ## Demo
 
 ```sh
@@ -27,6 +35,14 @@ gridlab-textual-scada-demo
 # or
 python -m gridlab_textual_scada.demos
 ```
+
+## Tests
+
+```sh
+pytest gridlab_textual_scada/tests
+```
+
+The apps run headless, with Textual's `run_test`.
 
 ## Versioning
 
