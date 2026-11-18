@@ -17,6 +17,7 @@ with real Modbus devices or simulators.
 """
 
 import asyncio
+import logging
 import sys
 import threading
 from pymodbus.server import ModbusTcpServer
@@ -26,6 +27,17 @@ from pymodbus.exceptions import NoSuchIdException
 from pymodbus.client import ModbusTcpClient
 import time
 from dataclasses import dataclass
+
+# pymodbus logs through the standard logging module. With no handler configured, Python
+# prints its warnings and errors raw to stderr, and pymodbus appends to each error the
+# last 20 Modbus frames the process sent or received (">>>>> recv: 0x0 0x9 ..."), from
+# any client or server in the process, not only the one that failed. The classes below
+# report failures to the caller (exceptions, connect() returning False), so pymodbus's
+# own messages are muted. An application that wants them sets a level on the "pymodbus"
+# logger: set before this import it is kept, set after it replaces this one.
+_pymodbus_logger = logging.getLogger("pymodbus")
+if _pymodbus_logger.level == logging.NOTSET:
+    _pymodbus_logger.setLevel(logging.CRITICAL)
 
 class _ModbusFailure(RuntimeError):
     """
