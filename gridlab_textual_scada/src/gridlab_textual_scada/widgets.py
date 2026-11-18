@@ -96,6 +96,11 @@ class NumericalDialog(ModalScreen[str | None]):
                 yield Button('Cancel', variant='error')
                 yield Button('OK', variant='success')
 
+    def on_mount(self) -> None:
+        # Textual ignores clicks on a button during its 0.2 s "active" effect, which would turn a quick "99" into "9"
+        for button in self.query(Button):
+            button.active_effect_duration = 0
+
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         label = str(event.button.label)
