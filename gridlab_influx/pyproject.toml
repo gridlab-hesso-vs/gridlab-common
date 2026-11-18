@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68", "setuptools_scm>=8"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gridlab-influx"
+dynamic = ["version"]
+description = "Write InfluxDB line protocol from anywhere in a process, optionally batched on a thread."
+requires-python = ">=3.10"
+dependencies = [
+  "requests",
+  "loguru",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools_scm]
+root = ".."
+git_describe_command = ["git", "describe", "--dirty", "--tags", "--long", "--match", "gridlab-influx-v*"]
+tag_regex = "^gridlab-influx-v(?P<version>.+)$"
+fallback_version = "0.0.0"
+version_file = "src/gridlab_influx/_version.py"

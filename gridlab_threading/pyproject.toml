@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68", "setuptools_scm>=8"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gridlab-threading"
+dynamic = ["version"]
+description = "Background and periodic tasks on threads, started and stopped together."
+requires-python = ">=3.10"
+dependencies = [
+  "loguru",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools_scm]
+root = ".."
+git_describe_command = ["git", "describe", "--dirty", "--tags", "--long", "--match", "gridlab-threading-v*"]
+tag_regex = "^gridlab-threading-v(?P<version>.+)$"
+fallback_version = "0.0.0"
+version_file = "src/gridlab_threading/_version.py"

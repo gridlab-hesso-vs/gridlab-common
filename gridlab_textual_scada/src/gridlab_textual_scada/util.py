@@ -4,10 +4,11 @@ external dependencies just to use the package.
 """
 
 import random
+import socket
 import threading
 import time
 
-import netifaces
+import psutil
 
 
 class PeriodicTask:
@@ -57,9 +58,8 @@ def get_local_ip_addresses() -> dict[str, list[str]]:
     """
     result: dict[str, list[str]] = {}
     try:
-        for interface in netifaces.interfaces():
-            ipv4_info = netifaces.ifaddresses(interface).get(netifaces.AF_INET, [])
-            ipv4 = [a["addr"] for a in ipv4_info if "addr" in a]
+        for interface, addresses in psutil.net_if_addrs().items():
+            ipv4 = [a.address for a in addresses if a.family == socket.AF_INET]
             if ipv4:
                 result[interface] = ipv4
     except Exception as e:
