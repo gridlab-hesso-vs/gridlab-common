@@ -23,4 +23,5 @@ from .widgets import (
     register_editor_value_validator,
 )
 from .app import TabApp, TabbedApp
+from .themes import SCADA_DARK, SCADA_LIGHT
 from .demos import Demo4AppTab, DemoApp, AllWidgetsDemo

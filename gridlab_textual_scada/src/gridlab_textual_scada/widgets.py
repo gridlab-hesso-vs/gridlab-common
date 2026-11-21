@@ -58,6 +58,7 @@ class NumericalDialog(ModalScreen[str | None]):
         height: 3;
         min-width: 0.95fr;
         width: 10;
+        text-style: bold;
     }
 
     .digits {
@@ -65,10 +66,11 @@ class NumericalDialog(ModalScreen[str | None]):
         background: $surface;
         color: $text;
         width: 45;
+        text-style: bold;           /* heavy strokes */
     }
 
     .title {
-        color: $primary-lighten-2;
+        color: $text;
         text-style: bold;
         width: 45;
         height: 3;
@@ -84,7 +86,7 @@ class NumericalDialog(ModalScreen[str | None]):
 
     def compose(self) -> ComposeResult:
         with Vertical(classes='dialog'):
-            yield Static(f'{self.title_label}', classes='title')
+            yield Static(self.title_label, classes='title', markup=False)     # a unit like [Hz] is not markup
             yield self.digits
             with Grid(classes='grid'):
                 for i in range(1, 10):

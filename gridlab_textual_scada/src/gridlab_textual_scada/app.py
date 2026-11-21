@@ -14,6 +14,7 @@ from textual.widget import Widget
 from textual.widgets import Log, Header, TabbedContent, TabPane
 
 from .util import PeriodicTask, get_local_ip_addresses
+from .themes import THEMES, VARIABLE_DEFAULTS
 
 
 class TabbedApp(App): ...
@@ -157,6 +158,9 @@ class TabbedApp(App):
 
     def __init__(self, update_period_sec:float=1, log_max_lines:int=10000, **kwargs):
         super().__init__(**kwargs)
+        # High-contrast themes (themes.py), for touchscreens: select with self.theme = 'scada-dark' or 'scada-light'
+        for theme in THEMES:
+            self.register_theme(theme)
         self._update_period_sec = update_period_sec
         self._mounted: bool = False
         # Beyond log_max_lines, the oldest lines are dropped, so that a long-running app does not fill the memory
@@ -168,6 +172,10 @@ class TabbedApp(App):
         self._loglines:list[str] = []
         # List of TabApp instances
         self._tabapps:list[TabApp] = []
+
+    def get_theme_variable_defaults(self) -> dict[str, str]:
+        """ Defaults of the variables the SCADA themes add ($scada-value, ...), for Textual's own themes. """
+        return {**super().get_theme_variable_defaults(), **VARIABLE_DEFAULTS}
 
     def __call__(self, message: str):
         """ Log a message to the console without timestamp. Can be called from any thread. """
