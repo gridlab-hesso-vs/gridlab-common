@@ -28,14 +28,14 @@ pip install "gridlab-influx @ git+https://github.com/gridlab-hesso-vs/gridlab-co
 
 ## Keeping a lab PC up to date
 
-`scripts/check_git_dirty.sh` checks every git repository one level below the
+`check_git_dirty.sh` checks every git repository one level below the
 current directory: uncommitted changes, and behind / ahead / diverged against
 its upstream (after a `git fetch`). With `--pull` it fast-forwards the repos that
 are behind and have no local changes, and leaves the others alone. Run it from
 the folder that holds the clones:
 
 ```bash
-cd ~/codes && gridlab-common/scripts/check_git_dirty.sh --pull
+cd ~/codes && gridlab-common/check_git_dirty.sh --pull
 ```
 
 `-n` skips the fetch. Exit status: 0 all good, 1 something dirty, 2 something
